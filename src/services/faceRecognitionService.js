@@ -2,7 +2,9 @@ import {
   env,
   bufferToImage,
   detectSingleFace,
-  TinyFaceDetectorOptions,
+  SsdMobilenetv1Options,
+  LabeledFaceDescriptors,
+  FaceMatcher,
 } from "face-api.js";
 import { Canvas, Image, ImageData } from "canvas";
 
@@ -10,120 +12,124 @@ import { Canvas, Image, ImageData } from "canvas";
 env.monkeyPatch({ Canvas, Image, ImageData });
 
 /**
- * Calculate Euclidean distance between two face descriptors
- * Lower distance = more similar faces
- */
-function euclideanDistance(descriptor1, descriptor2) {
-  if (descriptor1.length !== descriptor2.length) {
-    throw new Error("Descriptors must have the same length");
-  }
-
-  let sum = 0;
-  for (let i = 0; i < descriptor1.length; i++) {
-    const diff = descriptor1[i] - descriptor2[i];
-    sum += diff * diff;
-  }
-
-  return Math.sqrt(sum);
-}
-
-/**
- * Calculate cosine similarity between two face descriptors
- * Higher similarity = more similar faces (range: 0-1)
- */
-function cosineSimilarity(descriptor1, descriptor2) {
-  if (descriptor1.length !== descriptor2.length) {
-    throw new Error("Descriptors must have the same length");
-  }
-
-  let dotProduct = 0;
-  let norm1 = 0;
-  let norm2 = 0;
-
-  for (let i = 0; i < descriptor1.length; i++) {
-    dotProduct += descriptor1[i] * descriptor2[i];
-    norm1 += descriptor1[i] * descriptor1[i];
-    norm2 += descriptor2[i] * descriptor2[i];
-  }
-
-  const denominator = Math.sqrt(norm1) * Math.sqrt(norm2);
-  if (denominator === 0) {
-    return 0;
-  }
-
-  return dotProduct / denominator;
-}
-
-/**
  * Find matches for a face image against stored descriptors
+ * This follows the exact same logic as the React facial recognition component
+ *
+ * @param {Buffer} imageBuffer - The image buffer to match
+ * @param {Array} storedDescriptors - Array of objects with format: { label: string (JSON), descriptor: Float32Array }
+ * @param {number} distanceThreshold - Maximum distance to consider a match (default: 0.5)
+ * @returns {Promise<Array>} - Array of matches with similarity info
  */
 export async function findMatches(
   imageBuffer,
   storedDescriptors,
-  threshold = 0.6
+  distanceThreshold = 0.5
 ) {
   try {
-    // Extract descriptor from image
+    // Extract descriptor from image using same detector as React code
     const img = await bufferToImage(imageBuffer);
 
     const detection = await detectSingleFace(
       img,
-      new TinyFaceDetectorOptions()
-    ).withFaceDescriptor();
+      new SsdMobilenetv1Options({ minConfidence: 0.5 })
+    )
+      .withFaceLandmarks()
+      .withFaceDescriptor();
 
     if (!detection) {
       return [];
     }
 
-    const queryDescriptor = Array.from(detection.descriptor);
+    // Convert storedDescriptors to LabeledFaceDescriptors format
+    const labeledDescriptors = storedDescriptors
+      .map((stored) => {
+        // Handle different input formats
+        let label, descriptor;
 
-    // Compare with stored descriptors
-    const matches = [];
-
-    for (let i = 0; i < storedDescriptors.length; i++) {
-      const storedDesc = storedDescriptors[i];
-
-      // Handle descriptor format - could be array or object with descriptor property
-      let descriptor;
-      if (Array.isArray(storedDesc)) {
-        descriptor = storedDesc;
-      } else if (
-        storedDesc.descriptor &&
-        Array.isArray(storedDesc.descriptor)
-      ) {
-        descriptor = storedDesc.descriptor;
-      } else if (storedDesc.face && typeof storedDesc.face === "string") {
-        // If face is a JSON string, parse it
-        try {
-          descriptor = JSON.parse(storedDesc.face);
-        } catch {
-          continue;
+        if (stored.label && stored.descriptor) {
+          // Already in correct format
+          label = stored.label;
+          descriptor = Array.isArray(stored.descriptor)
+            ? Float32Array.from(stored.descriptor)
+            : stored.descriptor;
+        } else if (stored.nome && stored.codigoHub && stored.face) {
+          // Format: { nome, codigoHub, face: descriptor }
+          label = JSON.stringify({
+            nome: stored.nome,
+            codigoHub: stored.codigoHub,
+          });
+          descriptor =
+            typeof stored.face === "string"
+              ? Float32Array.from(JSON.parse(stored.face))
+              : Float32Array.from(stored.face);
+        } else if (stored.descriptor) {
+          // Format: { descriptor: [...] } with other metadata
+          label = JSON.stringify({
+            nome: stored.nome || "unknown",
+            codigoHub: stored.codigoHub || "unknown",
+          });
+          descriptor = Array.isArray(stored.descriptor)
+            ? Float32Array.from(stored.descriptor)
+            : stored.descriptor;
+        } else {
+          return null;
         }
-      } else {
-        continue;
-      }
 
-      // Calculate similarity
-      const similarity = cosineSimilarity(queryDescriptor, descriptor);
-      const distance = euclideanDistance(queryDescriptor, descriptor);
+        return new LabeledFaceDescriptors(label, [descriptor]);
+      })
+      .filter(Boolean);
 
-      if (similarity >= threshold) {
-        matches.push({
-          index: i,
-          similarity: similarity,
-          distance: distance,
-          metadata:
-            typeof storedDesc === "object" && !Array.isArray(storedDesc)
-              ? { ...storedDesc, descriptor: undefined, face: undefined }
-              : null,
-        });
-      }
+    if (labeledDescriptors.length === 0) {
+      return [];
     }
 
-    // Sort by similarity (highest first)
-    matches.sort((a, b) => b.similarity - a.similarity);
+    // Create FaceMatcher exactly like React code
+    const faceMatcher = new FaceMatcher(labeledDescriptors);
 
-    return matches;
+    // Find best match
+    const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+
+    // Apply same threshold logic as React: distance > 0.5 means reject
+    if (bestMatch.distance > distanceThreshold) {
+      return [
+        {
+          matched: false,
+          reason: "Face not recognized with sufficient confidence",
+          distance: bestMatch.distance,
+          label: "unknown",
+        },
+      ];
+    }
+
+    // Check if unknown
+    if (bestMatch.label === "unknown") {
+      return [
+        {
+          matched: false,
+          reason: "Face not recognized",
+          distance: bestMatch.distance,
+          label: "unknown",
+        },
+      ];
+    }
+
+    // Parse the label to get participant data
+    let participantData;
+    try {
+      participantData = JSON.parse(bestMatch.label);
+    } catch (error) {
+      participantData = { label: bestMatch.label };
+    }
+
+    return [
+      {
+        matched: true,
+        distance: bestMatch.distance,
+        similarity: 1 - bestMatch.distance, // Convert distance to similarity score
+        participant: participantData,
+        label: bestMatch.label,
+      },
+    ];
   } catch (error) {
     console.error("Error finding matches:", error);
     throw error;
@@ -132,74 +138,131 @@ export async function findMatches(
 
 /**
  * Find matches using a descriptor directly (without extracting from image)
+ *
+ * @param {Array|Float32Array|string} queryDescriptor - The face descriptor to match
+ * @param {Array} storedDescriptors - Array of stored face descriptors
+ * @param {number} distanceThreshold - Maximum distance to consider a match (default: 0.5)
+ * @returns {Promise<Array>} - Array of matches
  */
 export async function findMatchesByDescriptor(
   queryDescriptor,
   storedDescriptors,
-  threshold = 0.6
+  distanceThreshold = 0.5
 ) {
   try {
-    // Ensure queryDescriptor is an array
-    let queryDesc = queryDescriptor;
+    // Ensure queryDescriptor is Float32Array
+    let queryDesc;
     if (typeof queryDescriptor === "string") {
-      try {
-        queryDesc = JSON.parse(queryDescriptor);
-      } catch {
-        throw new Error("Invalid descriptor format");
-      }
+      queryDesc = Float32Array.from(JSON.parse(queryDescriptor));
+    } else if (Array.isArray(queryDescriptor)) {
+      queryDesc = Float32Array.from(queryDescriptor);
+    } else {
+      queryDesc = queryDescriptor;
     }
 
-    if (!Array.isArray(queryDesc)) {
-      throw new Error("Descriptor must be an array");
-    }
+    // Convert storedDescriptors to LabeledFaceDescriptors format
+    const labeledDescriptors = storedDescriptors
+      .map((stored) => {
+        let label, descriptor;
 
-    const matches = [];
-
-    for (let i = 0; i < storedDescriptors.length; i++) {
-      const storedDesc = storedDescriptors[i];
-
-      // Handle descriptor format
-      let descriptor;
-      if (Array.isArray(storedDesc)) {
-        descriptor = storedDesc;
-      } else if (
-        storedDesc.descriptor &&
-        Array.isArray(storedDesc.descriptor)
-      ) {
-        descriptor = storedDesc.descriptor;
-      } else if (storedDesc.face && typeof storedDesc.face === "string") {
-        try {
-          descriptor = JSON.parse(storedDesc.face);
-        } catch {
-          continue;
+        if (stored.label && stored.descriptor) {
+          label = stored.label;
+          descriptor = Array.isArray(stored.descriptor)
+            ? Float32Array.from(stored.descriptor)
+            : stored.descriptor;
+        } else if (stored.nome && stored.codigoHub && stored.face) {
+          label = JSON.stringify({
+            nome: stored.nome,
+            codigoHub: stored.codigoHub,
+          });
+          descriptor =
+            typeof stored.face === "string"
+              ? Float32Array.from(JSON.parse(stored.face))
+              : Float32Array.from(stored.face);
+        } else if (stored.descriptor) {
+          label = JSON.stringify({
+            nome: stored.nome || "unknown",
+            codigoHub: stored.codigoHub || "unknown",
+          });
+          descriptor = Array.isArray(stored.descriptor)
+            ? Float32Array.from(stored.descriptor)
+            : stored.descriptor;
+        } else {
+          return null;
         }
-      } else {
-        continue;
-      }
 
-      // Calculate similarity
-      const similarity = cosineSimilarity(queryDesc, descriptor);
-      const distance = euclideanDistance(queryDesc, descriptor);
+        return new LabeledFaceDescriptors(label, [descriptor]);
+      })
+      .filter(Boolean);
 
-      if (similarity >= threshold) {
-        matches.push({
-          index: i,
-          similarity: similarity,
-          distance: distance,
-          metadata:
-            typeof storedDesc === "object" && !Array.isArray(storedDesc)
-              ? { ...storedDesc, descriptor: undefined, face: undefined }
-              : null,
-        });
-      }
+    if (labeledDescriptors.length === 0) {
+      return [];
     }
 
-    // Sort by similarity (highest first)
-    matches.sort((a, b) => b.similarity - a.similarity);
+    // Create FaceMatcher
+    const faceMatcher = new FaceMatcher(labeledDescriptors);
 
-    return matches;
+    // Find best match
+    const bestMatch = faceMatcher.findBestMatch(queryDesc);
+
+    // Apply same threshold logic
+    if (bestMatch.distance > distanceThreshold) {
+      return [
+        {
+          matched: false,
+          reason: "Face not recognized with sufficient confidence",
+          distance: bestMatch.distance,
+          label: "unknown",
+        },
+      ];
+    }
+
+    if (bestMatch.label === "unknown") {
+      return [
+        {
+          matched: false,
+          reason: "Face not recognized",
+          distance: bestMatch.distance,
+          label: "unknown",
+        },
+      ];
+    }
+
+    // Parse the label
+    let participantData;
+    try {
+      participantData = JSON.parse(bestMatch.label);
+    } catch (error) {
+      participantData = { label: bestMatch.label };
+    }
+
+    return [
+      {
+        matched: true,
+        distance: bestMatch.distance,
+        similarity: 1 - bestMatch.distance,
+        participant: participantData,
+        label: bestMatch.label,
+      },
+    ];
   } catch (error) {
     console.error("Error finding matches by descriptor:", error);
     throw error;
   }
+}
+
+/**
+ * Helper function to create labeled descriptors in the correct format
+ * Use this when storing descriptors in your database
+ *
+ * @param {string} nome - Participant name
+ * @param {string} codigoHub - Participant code
+ * @param {Array|Float32Array} descriptor - Face descriptor
+ * @returns {Object} - Object ready to be stored
+ */
+export function createLabeledDescriptor(nome, codigoHub, descriptor) {
+  return {
+    label: JSON.stringify({ nome, codigoHub }),
+    descriptor: Array.isArray(descriptor) ? descriptor : Array.from(descriptor),
+  };
 }
