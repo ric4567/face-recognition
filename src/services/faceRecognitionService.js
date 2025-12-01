@@ -1,12 +1,11 @@
 import {
   env,
-  bufferToImage,
   detectSingleFace,
   SsdMobilenetv1Options,
   LabeledFaceDescriptors,
   FaceMatcher,
 } from "face-api.js";
-import { Canvas, Image, ImageData } from "canvas";
+import { Canvas, Image, ImageData, loadImage, createCanvas } from "canvas";
 
 // Configure face-api.js to use node-canvas
 env.monkeyPatch({ Canvas, Image, ImageData });
@@ -27,7 +26,12 @@ export async function findMatches(
 ) {
   try {
     // Extract descriptor from image using same detector as React code
-    const img = await bufferToImage(imageBuffer);
+    const img = await loadImage(imageBuffer);
+
+    // Create canvas from image
+    const canvas = createCanvas(img.width, img.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
 
     const detection = await detectSingleFace(
       img,
@@ -35,7 +39,6 @@ export async function findMatches(
     )
       .withFaceLandmarks()
       .withFaceDescriptor();
-
     if (!detection) {
       return [];
     }
@@ -46,31 +49,12 @@ export async function findMatches(
         // Handle different input formats
         let label, descriptor;
 
-        if (stored.label && stored.descriptor) {
+        if (stored.label && stored.descriptors) {
           // Already in correct format
           label = stored.label;
-          descriptor = Array.isArray(stored.descriptor)
-            ? Float32Array.from(stored.descriptor)
-            : stored.descriptor;
-        } else if (stored.nome && stored.codigoHub && stored.face) {
-          // Format: { nome, codigoHub, face: descriptor }
-          label = JSON.stringify({
-            nome: stored.nome,
-            codigoHub: stored.codigoHub,
-          });
-          descriptor =
-            typeof stored.face === "string"
-              ? Float32Array.from(JSON.parse(stored.face))
-              : Float32Array.from(stored.face);
-        } else if (stored.descriptor) {
-          // Format: { descriptor: [...] } with other metadata
-          label = JSON.stringify({
-            nome: stored.nome || "unknown",
-            codigoHub: stored.codigoHub || "unknown",
-          });
-          descriptor = Array.isArray(stored.descriptor)
-            ? Float32Array.from(stored.descriptor)
-            : stored.descriptor;
+          descriptor = Array.isArray(stored.descriptors)
+            ? Float32Array.from(stored.descriptors)
+            : stored.descriptors;
         } else {
           return null;
         }
